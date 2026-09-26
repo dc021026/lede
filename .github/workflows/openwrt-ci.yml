@@ -1,107 +1,206 @@
-# 
-# <https://github.com/KFERMercer/OpenWrt-CI>
-#
-# Copyright (C) 2019 P3TERX
-#
-# Copyright (C) 2020 KFERMercer
-#
-name: OpenWrt-CI
+# OpenWrt CI for Xiaomi CR660X (ramips/mt7621)
+# - Uses device defconfig at .ci/defconfigs/cr660x.config if present
+# - Falls back to a community example defconfig if not present
+# - Caches ./dl and ccache between runs
+# - Uploads firmware / packages / buildinfo artifacts
+name: OpenWrt-CI-CR660X
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: 0 20 * * *
+    - cron: '0 20 * * *'  # daily at 20:00 UTC
 
 permissions:
   contents: read
 
+env:
+  DEVICE_DEFCONFIG: .ci/defconfigs/cr660x.config
+  TARGET_PATH: bin/targets/ramips/mt7621
+  ARTIFACT_RETENTION_DAYS: 7
+  CCACHE_DIR: ${{ runner.temp }}/ccache
+  BUILD_JOBS: 8
+
 jobs:
-
   build_openwrt:
-
-    name: Build OpenWrt Firmware
-
+    name: Build OpenWrt for CR660X
     runs-on: ubuntu-22.04
-
+    strategy:
+      matrix:
+        jobs: [8]   # adjust to runner CPU; set 8 for typical hosted runner
     steps:
-      - name: Space cleanup and Initialization environment
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          docker image prune -f
-          sudo -E rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/apt/sources.list.d /usr/local/lib/android
-          sudo -E apt-mark hold grub-efi-amd64-signed
-          sudo -E apt update
-          sudo -E apt -y purge azure-cli* docker* ghc* zulu* llvm* firefox google* dotnet* powershell* openjdk* mysql* php* mongodb* dotnet* snap*
-          sudo -E apt -y full-upgrade
-          sudo -E apt -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk gcc-multilib g++-multilib gettext genisoimage git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool llvm lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
-          sudo -E systemctl daemon-reload
-          sudo -E apt -y autoremove --purge
-          sudo -E apt clean
-          sudo -E timedatectl set-timezone "Asia/Shanghai"
 
-      - name: Checkout OpenWrt
+      - name: Checkout repository (full)
         uses: actions/checkout@v4
-
-      - name: Free Disk Space (Ubuntu)
-        uses: jlumbroso/free-disk-space@main
         with:
-          # this might remove tools that are actually needed,
-          # if set to "true" but frees about 6 GB
-          tool-cache: true
-          # all of these default to true, but feel free to set to
-          # "false" if necessary for your workflow
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
+          fetch-depth: 0
 
-      - name: Update feeds
+      - name: Set up basic packages
         run: |
-          sed -i 's/#src-git helloworld/src-git helloworld/g' ./feeds.conf.default
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential ccache git-core subversion libncurses5-dev zlib1g-dev \
+            gawk flex gettext libssl-dev python3 python3-distutils \
+            pkg-config unzip wget binutils bzip2 curl rsync time bc u-boot-tools \
+            gcc-multilib g++-multilib
+          sudo apt-get -y autoremove
+          sudo apt-get -y clean
+
+      - name: Configure ccache
+        run: |
+          mkdir -p "${CCACHE_DIR}"
+          export CCACHE_DIR="${CCACHE_DIR}"
+          ccache -M 5G || true
+          echo "CCACHE_DIR=${CCACHE_DIR}"
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-openwrt-ccache-${{ hashFiles('**/.config', 'feeds.conf.default', env.DEVICE_DEFCONFIG) }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-ccache-
+
+      - name: Restore downloads cache (./dl)
+        uses: actions/cache@v4
+        with:
+          path: ./dl
+          key: ${{ runner.os }}-openwrt-dl-${{ hashFiles('feeds.conf.default', env.DEVICE_DEFCONFIG) }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-dl-
+
+      - name: Show disk before build
+        run: df -h || true
+
+      - name: Ensure feeds and patch helpers present
+        run: |
+          git submodule update --init --recursive || true
+          # ensure scripts are executable
+          chmod +x ./scripts/feeds || true
+
+      - name: Apply device defconfig (prefer repo, otherwise download example)
+        run: |
+          set -euxo pipefail
+          if [ -f "${{ env.DEVICE_DEFCONFIG }}" ]; then
+            echo "Using repository defconfig: ${{ env.DEVICE_DEFCONFIG }}"
+            cp "${{ env.DEVICE_DEFCONFIG }}" .config
+          else
+            echo "Repository defconfig not found; fetching community example as fallback."
+            # Community example raw URL (if you prefer another source, replace here)
+            curl -fsSL https://raw.githubusercontent.com/szdosar/Actions-OpenWrt/8dc1732da5611437844466bb9afb213cf3655e30/cr660x.config -o .config || true
+            if [ ! -f .config ]; then
+              echo "No defconfig available; fallback to make defconfig (may not select CR660X)."
+              make defconfig
+            fi
+          fi
+          # Ensure .config is applied and fill defaults non-interactively
+          if [ -f .config ]; then
+            yes '' | make oldconfig || true
+          fi
+          # show the selected target for debug
+          grep -E 'TARGET|DEVICE|CONFIG_TARGET' .config || true
+
+      - name: Update & install feeds
+        run: |
+          set -euxo pipefail
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Generate configuration file
-        run: make defconfig
-
-      - name: Download packages
-        run: make download -j16
-
-      - name: Compile firmware
+      - name: Download package sources (with retries)
         run: |
-          make -j$(nproc) || make -j1 V=s
-          echo "======================="
-          echo "Space usage:"
-          echo "======================="
-          df -h
-          echo "======================="
-          du -h --max-depth=1 ./ --exclude=build_dir --exclude=bin
-          du -h --max-depth=1 ./build_dir
-          du -h --max-depth=1 ./bin
+          set -euxo pipefail
+          retry() {
+            local n=1
+            local max=3
+            local delay=10
+            while true; do
+              "$@" && break || {
+                if [[ $n -lt $max ]]; then
+                  ((n++))
+                  echo "Command failed. Retry #$n in $delay seconds..."
+                  sleep $delay
+                else
+                  echo "The command has failed after $n attempts."
+                  return 1
+                fi
+              }
+            done
+          }
+          retry make download -j${{ matrix.jobs }}
 
-      - name: Prepare artifact
+      - name: Build (use ccache)
+        env:
+          CCACHE_DIR: ${{ env.CCACHE_DIR }}
         run: |
+          set -euxo pipefail
+          export CCACHE_DIR="${CCACHE_DIR}"
+          export USE_CCACHE=1
+          export PATH="$HOME/.local/bin:$PATH"
+          # Build; on failure run verbose single-threaded to capture logs
+          if ! make -j${{ matrix.jobs }} V=s; then
+            echo "Parallel build failed — retrying single-threaded with verbose output"
+            make -j1 V=s
+          fi
+
+      - name: Show disk after build
+        run: |
+          df -h || true
+          du -h --max-depth=1 . || true
+          du -h --max-depth=2 ./build_dir 2>/dev/null || true
+
+      - name: Prepare artifacts
+        run: |
+          set -euxo pipefail
           mkdir -p ./artifact/package
           mkdir -p ./artifact/buildinfo
-          rm -rf $(find ./bin/targets/ -type d -name "packages")
-          cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
-          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
+          mkdir -p ./artifact/firmware
+          # copy packages
+          if [ -d ./bin/packages ]; then
+            find ./bin/packages -type f -name "*.ipk" -exec cp -v {} ./artifact/package/ \; || true
+          fi
+          # copy buildinfo/manifest
+          find ./bin/targets -type f \( -name "*.buildinfo" -o -name "*.manifest" \) -exec cp -v {} ./artifact/buildinfo/ \; || true
+          # copy firmware for ramips/mt7621 device path (safe copy)
+          if [ -d "${{ env.TARGET_PATH }}" ]; then
+            cp -av "${{ env.TARGET_PATH }}"/* ./artifact/firmware/ || true
+          else
+            # fallback: copy all target bins
+            cp -av ./bin/targets/* ./artifact/firmware/ || true
+          fi
+          # create a small build summary
+          echo "Build time: $(date -u)" > ./artifact/buildinfo/summary.txt
+          echo "Git commit: $(git rev-parse --verify HEAD)" >> ./artifact/buildinfo/summary.txt
+          echo "Built device: xiaomi_mi-router-cr660x" >> ./artifact/buildinfo/summary.txt
+          echo "Contents of artifact/firmware:" >> ./artifact/buildinfo/summary.txt
+          ls -lah ./artifact/firmware >> ./artifact/buildinfo/summary.txt || true
 
       - name: Upload buildinfo
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt_buildinfo
+          name: openwrt_buildinfo_cr660x
           path: ./artifact/buildinfo/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
-      - name: Upload package
+      - name: Upload packages
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt_package
+          name: openwrt_packages_cr660x
           path: ./artifact/package/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: OpenWrt_firmware
-          path: ./bin/targets/
+          name: openwrt_firmware_cr660x
+          path: ./artifact/firmware/
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-openwrt-ccache-${{ hashFiles('**/.config', 'feeds.conf.default', env.DEVICE_DEFCONFIG) }}
+          restore-keys: |
+            ${{ runner.os }}-openwrt-ccache-
