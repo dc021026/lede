@@ -1,8 +1,4 @@
 # OpenWrt CI for Xiaomi CR660X (ramips/mt7621)
-# - Uses device defconfig at .ci/defconfigs/cr660x.config if present
-# - Falls back to a community example defconfig if not present
-# - Caches ./dl and ccache between runs
-# - Uploads firmware / packages / buildinfo artifacts
 name: OpenWrt-CI-CR660X
 
 on:
@@ -17,7 +13,6 @@ env:
   DEVICE_DEFCONFIG: .ci/defconfigs/cr660x.config
   TARGET_PATH: bin/targets/ramips/mt7621
   ARTIFACT_RETENTION_DAYS: 7
-  CCACHE_DIR: ${{ runner.temp }}/ccache
   BUILD_JOBS: 8
 
 jobs:
@@ -26,7 +21,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        jobs: [8]   # adjust to runner CPU; set 8 for typical hosted runner
+        jobs: [8]
     steps:
 
       - name: Checkout repository (full)
@@ -45,18 +40,18 @@ jobs:
           sudo apt-get -y autoremove
           sudo apt-get -y clean
 
-      - name: Configure ccache
+      - name: Configure ccache directory
         run: |
+          export CCACHE_DIR="${RUNNER_TEMP}/ccache"
           mkdir -p "${CCACHE_DIR}"
-          export CCACHE_DIR="${CCACHE_DIR}"
           ccache -M 5G || true
           echo "CCACHE_DIR=${CCACHE_DIR}"
+        shell: bash
 
       - name: Restore ccache
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ env.CCACHE_DIR }}
+          path: ${{ runner.temp }}/ccache
           key: ${{ runner.os }}-openwrt-ccache-${{ hashFiles('**/.config', 'feeds.conf.default', env.DEVICE_DEFCONFIG) }}
           restore-keys: |
             ${{ runner.os }}-openwrt-ccache-
@@ -75,7 +70,6 @@ jobs:
       - name: Ensure feeds and patch helpers present
         run: |
           git submodule update --init --recursive || true
-          # ensure scripts are executable
           chmod +x ./scripts/feeds || true
 
       - name: Apply device defconfig (prefer repo, otherwise download example)
@@ -86,18 +80,15 @@ jobs:
             cp "${{ env.DEVICE_DEFCONFIG }}" .config
           else
             echo "Repository defconfig not found; fetching community example as fallback."
-            # Community example raw URL (if you prefer another source, replace here)
             curl -fsSL https://raw.githubusercontent.com/szdosar/Actions-OpenWrt/8dc1732da5611437844466bb9afb213cf3655e30/cr660x.config -o .config || true
             if [ ! -f .config ]; then
               echo "No defconfig available; fallback to make defconfig (may not select CR660X)."
               make defconfig
             fi
           fi
-          # Ensure .config is applied and fill defaults non-interactively
           if [ -f .config ]; then
             yes '' | make oldconfig || true
           fi
-          # show the selected target for debug
           grep -E 'TARGET|DEVICE|CONFIG_TARGET' .config || true
 
       - name: Update & install feeds
@@ -130,12 +121,11 @@ jobs:
 
       - name: Build (use ccache)
         env:
-          CCACHE_DIR: ${{ env.CCACHE_DIR }}
+          CCACHE_DIR: ${{ runner.temp }}/ccache
         run: |
           set -euxo pipefail
-          export CCACHE_DIR="${CCACHE_DIR}"
+          export CCACHE_DIR="${RUNNER_TEMP}/ccache"
           export USE_CCACHE=1
-          export PATH="$HOME/.local/bin:$PATH"
           # Build; on failure run verbose single-threaded to capture logs
           if ! make -j${{ matrix.jobs }} V=s; then
             echo "Parallel build failed — retrying single-threaded with verbose output"
@@ -154,20 +144,15 @@ jobs:
           mkdir -p ./artifact/package
           mkdir -p ./artifact/buildinfo
           mkdir -p ./artifact/firmware
-          # copy packages
           if [ -d ./bin/packages ]; then
             find ./bin/packages -type f -name "*.ipk" -exec cp -v {} ./artifact/package/ \; || true
           fi
-          # copy buildinfo/manifest
           find ./bin/targets -type f \( -name "*.buildinfo" -o -name "*.manifest" \) -exec cp -v {} ./artifact/buildinfo/ \; || true
-          # copy firmware for ramips/mt7621 device path (safe copy)
           if [ -d "${{ env.TARGET_PATH }}" ]; then
             cp -av "${{ env.TARGET_PATH }}"/* ./artifact/firmware/ || true
           else
-            # fallback: copy all target bins
             cp -av ./bin/targets/* ./artifact/firmware/ || true
           fi
-          # create a small build summary
           echo "Build time: $(date -u)" > ./artifact/buildinfo/summary.txt
           echo "Git commit: $(git rev-parse --verify HEAD)" >> ./artifact/buildinfo/summary.txt
           echo "Built device: xiaomi_mi-router-cr660x" >> ./artifact/buildinfo/summary.txt
@@ -199,8 +184,7 @@ jobs:
         if: always()
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ env.CCACHE_DIR }}
+          path: ${{ runner.temp }}/ccache
           key: ${{ runner.os }}-openwrt-ccache-${{ hashFiles('**/.config', 'feeds.conf.default', env.DEVICE_DEFCONFIG) }}
           restore-keys: |
             ${{ runner.os }}-openwrt-ccache-
